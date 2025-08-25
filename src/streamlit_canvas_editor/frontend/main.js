@@ -1617,14 +1617,24 @@ function drawResizeHandles(rect) {
     });
 }
 
-// Streamlit communication
+/**
+ * Sends the current component state to Streamlit.
+ * This function now also sets a flag to prevent the immediate "echo"
+ * from Streamlit from overwriting the local state.
+ */
 function sendDataToStreamlit() {
-    // Don't send data if we're processing OCR or should skip
-    if (isProcessingOCR || skipNextUpdate) {
-        console.log("Skipping data send - OCR in progress or skip flag set");
+    // Do not send updates if an OCR operation is actively waiting for a response.
+    // This prevents sending intermediate states while waiting for OCR text.
+    if (isProcessingOCR) {
+        console.log("Skipping data send: an OCR operation is in progress.");
         return;
     }
-    
+
+    // KEY CHANGE: Signal that we are initiating an update. The next render from
+    // Streamlit containing `rectangles` should be ignored as it will be stale.
+    skipNextUpdate = true;
+    console.log("Setting skipNextUpdate = true before sending data.");
+
     const data = {
         rectangles: rectangles.map((rect, index) => ({
             Block_ID: rect.Block_ID,
@@ -1642,7 +1652,7 @@ function sendDataToStreamlit() {
         canvas_height: canvas.height,
         zoom_level: zoomLevel,
     };
-    
+
     console.log("Sending to Streamlit:", data);
     Streamlit.setComponentValue(data);
 }
@@ -1668,133 +1678,99 @@ function bboxToRect(bbox) {
 }
 
 // Update onRender to reassign IDs when loading rectangles
+/**
+ * Handles all data updates from Streamlit.
+ */
 function onRender(event) {
     console.log("Render event received", event.detail);
-    
+
     if (!window.rendered) {
         initCanvas();
         window.rendered = true;
     }
-    
+
     const data = event.detail.args;
-    
-    if (data) {
-        // Load background image if provided
-        if (data.image_data && !imageLoaded) {
-            console.log("Loading background image...");
-            loadImage(data.image_data);
+    if (!data) return;
+
+    // Load background image if provided
+    if (data.image_data && !imageLoaded) {
+        loadImage(data.image_data);
+    }
+
+    // Update OCR capability
+    if (data.ocr_enabled !== undefined) {
+        ocrEnabled = data.ocr_enabled;
+    }
+
+    // Handle OCR response first, as it's a special case
+    if (data.ocr_response && data.ocr_response.text !== undefined) {
+        console.log("🎯 OCR Response received:", data.ocr_response);
+        const { text: ocrText, rect_index: rectIndex, request_id: requestId } = data.ocr_response;
+
+        if (requestId === currentOCRRequestId) {
+            if (rectIndex >= 0 && rectIndex < rectangles.length) {
+                rectangles[rectIndex].Text_Content = ocrText;
+                if (rectIndex === selectedRectIndex) {
+                    selectedRect.Text_Content = ocrText;
+                    const textContentElement = document.getElementById('text-content');
+                    if (textContentElement) textContentElement.value = ocrText;
+                    resetOCRButton();
+                }
+                
+                isProcessingOCR = false;
+                currentOCRRequestId = null;
+                currentlyProcessingBlockId = null;
+
+                redrawCanvas();
+                saveHistory();
+                updateStatus(`OCR completed for ${rectangles[rectIndex].Block_ID}`);
+                sendDataToStreamlit(); // This will set skipNextUpdate = true
+            }
         }
+        return; // Stop processing after handling OCR response
+    }
+
+    // Handle general rectangle updates
+    if (data.rectangles && Array.isArray(data.rectangles)) {
         
-        // Check if OCR is enabled
-        if (data.ocr_enabled !== undefined) {
-            ocrEnabled = data.ocr_enabled;
-            console.log("OCR enabled:", ocrEnabled);
+        // KEY CHANGE: This is the generic fix for the race condition.
+        // If the flag is set, it means we just sent an update, so we ignore
+        // the immediate, stale data echoed back from Streamlit.
+        if (skipNextUpdate) {
+            console.log("Ignoring stale rectangle data from Streamlit as requested by skipNextUpdate flag.");
+            skipNextUpdate = false; // Reset the flag for the next real update
+            return; // Exit, preserving our correct local state
         }
 
-        // Check for OCR response - PROCESS THIS FIRST
-        if (data.ocr_response && data.ocr_response.text !== undefined) {
-            console.log("🎯 OCR Response received:", data.ocr_response);
-            
-            const ocrText = data.ocr_response.text;
-            const rectIndex = data.ocr_response.rect_index;
-            const requestId = data.ocr_response.request_id;
-            
-            // Only process if this is the current OCR request
-            if (requestId === currentOCRRequestId || !currentOCRRequestId) {
-                // Update the rectangle
-                if (rectIndex >= 0 && rectIndex < rectangles.length) {
-                    console.log(`Updating rectangle ${rectIndex} with OCR text: ${ocrText}`);
-                    
-                    rectangles[rectIndex].Text_Content = ocrText;
-                    
-                    // Update UI if this is the selected rectangle
-                    if (rectIndex === selectedRectIndex) {
-                        selectedRect = rectangles[rectIndex]; // Update the reference
-                        
-                        const textContentElement = document.getElementById('text-content');
-                        if (textContentElement) {
-                            textContentElement.value = ocrText;
-                            console.log("✅ Updated text field with OCR result");
-                        }
-                        
-                        // Reset OCR button
-                        resetOCRButton();
-                    }
-                    
-                    // Reset OCR state
-                    isProcessingOCR = false;
-                    currentOCRRequestId = null;
-                    currentlyProcessingBlockId = null;
-                    
-                    // Update panel title back to normal
-                    const panel = document.getElementById('properties-panel');
-                    if (panel && panel.style.display === 'flex') {
-                        const panelTitle = panel.querySelector('.panel-title');
-                        if (panelTitle) {
-                            panelTitle.innerHTML = '📝 Rectangle Properties';
-                        }
-                    }
-                    
-                    // Update canvas
-                    redrawCanvas();
-                    
-                    // Save to history
-                    saveHistory();
-                    
-                    updateStatus(`OCR completed for ${rectangles[rectIndex].Block_ID}`);
-                    
-                    // Send updated data back to Streamlit
-                    sendDataToStreamlit();
-                }
-            } else {
-                console.log(`Ignoring OCR response for request ${requestId} (current: ${currentOCRRequestId})`);
+        const newRectanglesStr = JSON.stringify(data.rectangles);
+        const currentRectanglesStr = JSON.stringify(rectangles);
+
+        if (newRectanglesStr !== currentRectanglesStr) {
+            console.log("Loading rectangles from Streamlit:", data.rectangles);
+            rectangles = data.rectangles.map(rect => ({
+                x: rect.x || 0,
+                y: rect.y || 0,
+                width: rect.width || 100,
+                height: rect.height || 50,
+                Block_ID: rect.Block_ID || generateBlockId(),
+                Block_Type: rect.Block_Type || 'Text',
+                Text_Content: rect.Text_Content || '',
+                Text_ID: rect.Text_ID || '',
+                Boundary_Boxes: rect.Boundary_Boxes || [0, 0, 100, 50]
+            }));
+
+            if (selectedRectIndex >= 0 && selectedRectIndex < rectangles.length) {
+                selectedRect = rectangles[selectedRectIndex];
             }
-            
-            // Don't process rectangles update in the same cycle as OCR response
-            return;
+
+            redrawCanvas();
+            updateStatus(`Loaded ${rectangles.length} rectangles`);
         }
-        
-        // Rest of the function remains the same...
-        // Load rectangles if provided (only if not processing OCR response)
-        if (data.rectangles && Array.isArray(data.rectangles)) {
-            console.log("Loading rectangles:", data.rectangles);
-            
-            // Check if rectangles have actually changed
-            const newRectanglesStr = JSON.stringify(data.rectangles);
-            const currentRectanglesStr = JSON.stringify(rectangles);
-            
-            if (newRectanglesStr !== currentRectanglesStr) {
-                rectangles = data.rectangles.map(rect => ({
-                    x: rect.x || 0,
-                    y: rect.y || 0,
-                    width: rect.width || 100,
-                    height: rect.height || 50,
-                    Block_ID: rect.Block_ID || generateBlockId(),
-                    Block_Type: rect.Block_Type || 'Text',
-                    Text_Content: rect.Text_Content || '',
-                    Text_ID: rect.Text_ID || '',
-                    Boundary_Boxes: rect.Boundary_Boxes || [0, 0, 100, 50]
-                }));
-                
-                // Update selected rectangle if it exists
-                if (selectedRectIndex >= 0 && selectedRectIndex < rectangles.length) {
-                    selectedRect = rectangles[selectedRectIndex];
-                    // Update the properties panel if it's open
-                    if (document.getElementById('properties-panel').style.display === 'flex') {
-                        showPropertiesPanel(selectedRect);
-                    }
-                }
-                
-                redrawCanvas();
-                updateStatus(`Loaded ${rectangles.length} rectangles`);
-            }
-        }
-        
-        // Update block type colors if provided
-        if (data.block_type_colors) {
-            blockTypeColors = data.block_type_colors;
-            console.log("Updated block type colors:", blockTypeColors);
-        }
+    }
+
+    // Update block type colors if provided
+    if (data.block_type_colors) {
+        blockTypeColors = data.block_type_colors;
     }
 }
 
