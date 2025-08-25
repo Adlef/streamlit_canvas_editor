@@ -7,7 +7,7 @@ long_description = (this_directory / "README.md").read_text()
 
 setuptools.setup(
     name="streamlit_canvas_editor",
-    version="0.5.0",
+    version="0.6.0",
     author="Adrien Lefèvre",
     author_email="adrien.lefevre@etas.com",
     description="Streamlit component that allows you to do X",
@@ -20,3 +20,4 @@ setuptools.setup(
     python_requires=">=3.7",
     install_requires=["streamlit>=1.2", "jinja2"],
 )
+
