@@ -275,77 +275,65 @@ function setupEventListeners() {
     canvas.addEventListener('mousemove', handleMouseMove);
     canvas.addEventListener('mouseup', handleMouseUp);
     canvas.addEventListener('mouseout', handleMouseOut);
-    
+
     // Mouse wheel for zoom
     canvasWrapper.addEventListener('wheel', handleWheel);
-    
+
     // Keyboard events
     document.addEventListener('keydown', handleKeyDown);
 
     // Mode toggle buttons
     document.getElementById('pan-mode-btn')?.addEventListener('click', () => setCanvasMode('pan'));
     document.getElementById('draw-mode-btn')?.addEventListener('click', () => setCanvasMode('draw'));
-    
+
     // Control buttons
     document.getElementById('undo-btn')?.addEventListener('click', undo);
     document.getElementById('redo-btn')?.addEventListener('click', redo);
     document.getElementById('zoom-in-btn')?.addEventListener('click', zoomIn);
     document.getElementById('zoom-out-btn')?.addEventListener('click', zoomOut);
     document.getElementById('zoom-reset-btn')?.addEventListener('click', zoomReset);
-    
-    // Save properties button - use event delegation to ensure it always works
+
+    // Use event delegation for all panel buttons to ensure they always work
     document.addEventListener('click', function(e) {
-        if (e.target && e.target.id === 'save-properties') {
+        const targetId = e.target.id;
+        const closestButtonId = e.target.closest('button')?.id;
+
+        if (targetId === 'save-properties') {
             e.preventDefault();
             saveProperties();
-        }
-        if (e.target && e.target.id === 'close-panel') {
+        } else if (targetId === 'close-panel') {
             e.preventDefault();
             hidePropertiesPanel();
+        } else if (targetId === 'reset-properties') {
+            e.preventDefault();
+            resetProperties();
+        } else if (targetId === 'ocr-btn' || closestButtonId === 'ocr-btn') {
+            e.preventDefault();
+            e.stopPropagation();
+            performOCR();
         }
     });
-    
-    // Block type change event - use event delegation to avoid losing the handler
+
+    // Event listener for dropdowns (e.g., block type)
     document.addEventListener('change', function(e) {
+        // For dropdowns, the change is a single, discrete event.
+        // We can save immediately without debouncing.
         if (e.target && e.target.id === 'block-type') {
-            autoSaveProperties();
-            // Update theme when block type changes
+            autoSaveProperties(); // Save immediately
             const blockType = e.target.value;
             if (blockType) {
-                updatePanelTheme(blockType);
+                updatePanelTheme(blockType); // Update panel theme
             }
         }
     });
-    
+
+    // Event listener for text inputs (the source of the original problem)
     document.addEventListener('input', function(e) {
+        // For text fields, use the debounced save to prevent excessive updates.
         if (e.target && (e.target.id === 'text-content' || e.target.id === 'text-id')) {
-            autoSaveProperties();
-        }
-    });
-
-    // In setupEventListeners function, add:
-    document.addEventListener('click', function(e) {
-        if (e.target && e.target.id === 'save-properties') {
-            e.preventDefault();
-            saveProperties();
-        }
-        if (e.target && e.target.id === 'close-panel') {
-            e.preventDefault();
-            hidePropertiesPanel();
-        }
-        // Add reset button handler
-        if (e.target && e.target.id === 'reset-properties') {
-            e.preventDefault();
-            resetProperties();
-        }
-    });
-
-    // OCR button click handler - use event delegation
-    document.addEventListener('click', function(e) {
-        if (e.target && (e.target.id === 'ocr-btn' || e.target.closest('#ocr-btn'))) {
-        e.preventDefault();
-        e.stopPropagation();
-        performOCR();
+            // By calling the debounced version, we wait for the user to stop typing
+            // before saving and sending data to Streamlit. This is the key optimization.
+            debouncedAutoSave();
         }
     });
 }
@@ -930,36 +918,82 @@ function hidePropertiesPanel() {
     }
 }
 
-// Update the autoSaveProperties function
-function autoSaveProperties() {
-    if (selectedRect && selectedRectIndex >= 0) {
-        saveProperties(false);
-    }
-}
-
+/**
+ * Saves the properties from the side panel to the selected rectangle object.
+ * This is the primary function for persisting user changes.
+ * @param {boolean} [addToHistory=true] - If true, the change is saved to the undo/redo history.
+ */
 function saveProperties(addToHistory = true) {
+    console.log("saveProperties called");
+
     if (selectedRect && selectedRectIndex >= 0) {
-        // Keep the Block_ID unchanged (it's readonly)
-        if (!selectedRect.Block_ID) {
-            selectedRect.Block_ID = document.getElementById('content-id').value;
+        // Get the form elements
+        const blockTypeElement = document.getElementById('block-type');
+        const textContentElement = document.getElementById('text-content');
+        const textIdElement = document.getElementById('text-id');
+
+        // Update rectangle properties from the form, checking if elements exist
+        if (blockTypeElement) {
+            selectedRect.Block_Type = blockTypeElement.value;
         }
-        
-        selectedRect.Block_Type = document.getElementById('block-type').value;
-        selectedRect.Text_Content = document.getElementById('text-content').value;
-        selectedRect.Text_ID = document.getElementById('text-id').value;
-        
-        // Update Boundary_Boxes
+        if (textContentElement) {
+            selectedRect.Text_Content = textContentElement.value;
+        }
+        if (textIdElement) {
+            selectedRect.Text_ID = textIdElement.value;
+        }
+
+        // Update Boundary_Boxes based on the rectangle's current geometry
         selectedRect.Boundary_Boxes = rectToBbox(selectedRect);
-        
+
+        // Update the main rectangles array
         rectangles[selectedRectIndex] = selectedRect;
-        
+
+        console.log("Updated rectangle:", selectedRect);
+
         if (addToHistory) {
             saveHistory();
         }
-        
+
         redrawCanvas();
         sendDataToStreamlit();
         updateStatus(`Properties saved for ${selectedRect.Block_ID}`);
+    } else {
+        console.log("No selected rectangle to save");
+    }
+}
+
+/**
+ * Creates a debounced function that delays invoking `func` until after `wait`
+ * milliseconds have elapsed since the last time the debounced function was invoked.
+ * This is essential for preventing excessive function calls on high-frequency events.
+ * @param {Function} func The function to debounce.
+ * @param {number} wait The number of milliseconds to delay.
+ * @returns {Function} Returns the new debounced function.
+ */
+function debounce(func, wait) {
+    let timeout;
+
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func.apply(this, args);
+        };
+
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+/**
+ * A wrapper for saveProperties that defaults to not adding an entry to the history.
+ * This is used for frequent, automatic updates like typing.
+ */
+function autoSaveProperties() {
+    if (selectedRect && selectedRectIndex >= 0) {
+        // The 'false' argument prevents each keystroke from cluttering the undo/redo history.
+        // A final manual save or another action will create a history entry.
+        saveProperties(false);
     }
 }
 
