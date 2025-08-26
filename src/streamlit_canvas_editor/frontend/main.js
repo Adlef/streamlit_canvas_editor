@@ -13,7 +13,6 @@ let selectedRectIndex = -1;
 let resizeHandle = null;
 let dragOffset = { x: 0, y: 0 };
 let imageLoaded = false;
-let blockCounter = 0;
 let ocrEnabled = false;
 let skipNextUpdate = false;
 let isProcessingOCR = false;
@@ -23,13 +22,20 @@ let currentlyProcessingBlockId = null;
 let zoomLevel = 1.0;
 const ZOOM_MIN = 0.25, ZOOM_MAX = 4.0, ZOOM_STEP = 0.25;
 
+// base drawing buffer size (updated to image size on load)
+let baseCanvasWidth = 800;
+let baseCanvasHeight = 600;
+
+// pan helpers
+let canvasMode = 'draw'; // 'draw' or 'pan'
+let isPanning = false;
+let panStartClientX = 0, panStartClientY = 0;
+let panStartScrollLeft = 0, panStartScrollTop = 0;
+
 let originalRect = null, resizeStartPos = null;
 
 let history = [], historyStep = -1;
 const MAX_HISTORY = 50;
-
-let canvasMode = 'draw'; // 'draw' or 'pan'
-let isPanning = false, panStartX = 0, panStartY = 0;
 
 const HANDLE_SIZE = 10, HANDLE_HIT_SIZE = 20;
 const SELECTED_COLOR = '#FF5722';
@@ -56,6 +62,8 @@ let blockTypeColors = {
 const getRoot = () => document.getElementById('root') || document.body;
 
 // ----- Helpers -----
+function uid() { return `r_${Math.random().toString(36).slice(2)}_${Date.now()}`; }
+
 function getBlockTypeColor(blockType) {
   if (blockTypeColors && blockTypeColors[blockType]) return blockTypeColors[blockType];
   if (blockTypeColors && blockTypeColors['other']) return blockTypeColors['other'];
@@ -70,6 +78,51 @@ function getLighterColor(hexColor, opacity = 0.15) {
   return `rgba(${r}, ${g}, ${b}, ${opacity})`;
 }
 
+// Layout-based zoom: scale via CSS width/height (not transforms)
+function applyZoomCss() {
+  const cssW = Math.max(1, Math.round(baseCanvasWidth  * zoomLevel));
+  const cssH = Math.max(1, Math.round(baseCanvasHeight * zoomLevel));
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  if (canvasContainer) {
+    canvasContainer.style.width  = canvas.style.width;
+    canvasContainer.style.height = canvas.style.height;
+  }
+}
+
+// ----- ID MANAGEMENT (top-to-bottom renumbering) -----
+function ensureUids() {
+  rectangles.forEach(r => { if (!r._uid) r._uid = uid(); });
+}
+
+function renumberBlockIds(preserveSelection = true) {
+  ensureUids();
+  const selUid = preserveSelection && selectedRect ? selectedRect._uid : null;
+
+  // sort by y then x for ordering
+  const sorted = rectangles.slice().sort((a, b) => {
+    if (a.y === b.y) return a.x - b.x;
+    return a.y - b.y;
+  });
+
+  const idMap = new Map();
+  sorted.forEach((r, i) => idMap.set(r._uid, `block_${i + 1}`));
+
+  rectangles.forEach(r => { r.Block_ID = idMap.get(r._uid); });
+
+  // keep selection by uid
+  if (selUid) {
+    selectedRectIndex = rectangles.findIndex(r => r._uid === selUid);
+    selectedRect = selectedRectIndex >= 0 ? rectangles[selectedRectIndex] : null;
+  }
+
+  // update Block ID field in panel if open
+  const blockIdField = document.getElementById('content-id');
+  if (blockIdField && selectedRect) blockIdField.value = selectedRect.Block_ID;
+
+  redrawCanvas();
+}
+
 // ----- Init -----
 function initCanvas() {
   canvas = document.getElementById('drawing-canvas');
@@ -82,8 +135,9 @@ function initCanvas() {
   }
 
   ctx = canvas.getContext('2d');
-  canvas.width = 800;
-  canvas.height = 600;
+  canvas.width = baseCanvasWidth;
+  canvas.height = baseCanvasHeight;
+  applyZoomCss();
 
   setupEventListeners();
   redrawCanvas();
@@ -99,8 +153,8 @@ function setupEventListeners() {
   canvas.addEventListener('mouseup', handleMouseUp);
   canvas.addEventListener('mouseout', handleMouseOut);
 
-  // Zoom wheel
-  canvasWrapper.addEventListener('wheel', handleWheel);
+  // Zoom wheel: ctrl/cmd + wheel zooms, plain wheel scrolls wrapper
+  canvasWrapper.addEventListener('wheel', handleWheel, { passive: false });
 
   // Keyboard (iframe-scoped)
   document.addEventListener('keydown', handleKeyDown);
@@ -234,7 +288,7 @@ function resetOCRButton() {
 
 function packRect(rect) {
   return {
-    Block_ID: rect.Block_ID,
+    Block_ID: rect.Block_ID,             // ALWAYS our generated ID
     Block_Type: rect.Block_Type || 'Text',
     Text_Content: rect.Text_Content || '',
     Text_ID: rect.Text_ID || '',
@@ -360,7 +414,12 @@ function showPropertiesPanel(rect) {
   const textContentField = document.getElementById('text-content');
   const textIdField = document.getElementById('text-id');
 
-  if (blockIdField) blockIdField.value = rect.Block_ID || generateBlockId();
+  if (blockIdField) {
+    blockIdField.value = rect.Block_ID;     // show our generated ID
+    blockIdField.readOnly = true;           // ID is NOT editable
+    blockIdField.style.background = '#e9ecef';
+    blockIdField.style.cursor = 'not-allowed';
+  }
   const blockType = rect.Block_Type || 'Text';
   if (blockTypeField) blockTypeField.value = blockType;
   if (textContentField) textContentField.value = rect.Text_Content || '';
@@ -422,6 +481,7 @@ function saveProperties(addToHistory = true) {
     rectangles[selectedRectIndex] = selectedRect;
 
     if (addToHistory) saveHistory();
+    renumberBlockIds();              // keep IDs in order after edits
     redrawCanvas();
     sendDataToStreamlit();
     updateStatus(`Properties saved for ${selectedRect.Block_ID}`);
@@ -434,57 +494,64 @@ function autoSaveProperties() {
   }
 }
 
-// ---- Reset Content (adds the missing function) ----
+// ---- Reset Content ----
 function resetProperties() {
   if (!selectedRect || selectedRectIndex < 0) {
     updateStatus("No selected rectangle to reset");
     return;
   }
-
-  // Panel fields
   const blockTypeField   = document.getElementById('block-type');
   const textContentField = document.getElementById('text-content');
   const textIdField      = document.getElementById('text-id');
 
-  // Reset UI fields
   if (textContentField) textContentField.value = '';
   if (textIdField)      textIdField.value      = '';
   if (blockTypeField)   blockTypeField.value   = 'Text';
 
-  // Reset the rectangle model
   selectedRect.Text_Content   = '';
   selectedRect.Text_ID        = '';
   selectedRect.Block_Type     = 'Text';
   selectedRect.Boundary_Boxes = rectToBbox(selectedRect);
 
-  // Persist back to array
   rectangles[selectedRectIndex] = selectedRect;
 
-  // Book-keeping + UI updates
   saveHistory();
   updateBoundaryBoxDisplay();
   updatePanelTheme('Text');
+  renumberBlockIds();
   redrawCanvas();
   sendDataToStreamlit();
   updateStatus(`Content reset for ${selectedRect.Block_ID}`);
 }
 
 // ----- Zoom / pan / mouse -----
-function zoomIn(){ setZoom(Math.min(zoomLevel + ZOOM_STEP, ZOOM_MAX)); }
-function zoomOut(){ setZoom(Math.max(zoomLevel - ZOOM_STEP, ZOOM_MIN)); }
-function zoomReset(){ setZoom(1.0); centerCanvas(); updateStatus("Zoom reset to 100%"); }
+function zoomIn(){ setZoom(zoomLevel + ZOOM_STEP); }
+function zoomOut(){ setZoom(zoomLevel - ZOOM_STEP); }
+
+function zoomReset(){
+  zoomLevel = 1.0;
+  applyZoomCss();
+  centerCanvas();
+  updateZoomDisplay();
+  updateStatus("Zoom reset to 100%");
+}
 
 function setZoom(newZoom){
-  const scrollCenterX = canvasWrapper.scrollLeft + canvasWrapper.clientWidth / 2;
-  const scrollCenterY = canvasWrapper.scrollTop + canvasWrapper.clientHeight / 2;
-  const canvasCenterX = scrollCenterX / zoomLevel;
-  const canvasCenterY = scrollCenterY / zoomLevel;
+  newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
+  if (newZoom === zoomLevel) return;
+
+  // Keep the center point stable
+  const rect = canvasWrapper.getBoundingClientRect();
+  const centerX = rect.width / 2;
+  const centerY = rect.height / 2;
+  const preX = (canvasWrapper.scrollLeft + centerX) / zoomLevel;
+  const preY = (canvasWrapper.scrollTop  + centerY) / zoomLevel;
 
   zoomLevel = newZoom;
-  canvasContainer.style.transform = `scale(${zoomLevel})`;
+  applyZoomCss();
 
-  canvasWrapper.scrollLeft = canvasCenterX * zoomLevel - canvasWrapper.clientWidth / 2;
-  canvasWrapper.scrollTop  = canvasCenterY * zoomLevel - canvasWrapper.clientHeight / 2;
+  canvasWrapper.scrollLeft = preX * zoomLevel - centerX;
+  canvasWrapper.scrollTop  = preY * zoomLevel - centerY;
 
   updateZoomDisplay();
   updateZoomButtons();
@@ -494,23 +561,9 @@ function handleWheel(e){
   if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
     const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
-    const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel + delta));
-
-    const rect = canvasWrapper.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    const canvasX = (canvasWrapper.scrollLeft + mouseX) / zoomLevel;
-    const canvasY = (canvasWrapper.scrollTop + mouseY) / zoomLevel;
-
-    zoomLevel = newZoom;
-    canvasContainer.style.transform = `scale(${zoomLevel})`;
-    canvasWrapper.scrollLeft = canvasX * zoomLevel - mouseX;
-    canvasWrapper.scrollTop  = canvasY * zoomLevel - mouseY;
-
-    updateZoomDisplay();
-    updateZoomButtons();
+    setZoom(zoomLevel + delta);
   }
+  // else: allow natural scrolling of canvasWrapper
 }
 
 function updateZoomDisplay(){
@@ -525,12 +578,12 @@ function updateZoomButtons(){
   if (zout) zout.disabled = zoomLevel <= ZOOM_MIN;
 }
 function centerCanvas(){
-  const containerWidth = canvas.width * zoomLevel;
-  const containerHeight = canvas.height * zoomLevel;
+  const cssW = baseCanvasWidth  * zoomLevel;
+  const cssH = baseCanvasHeight * zoomLevel;
   const wrapperWidth = canvasWrapper.clientWidth;
   const wrapperHeight = canvasWrapper.clientHeight;
-  canvasWrapper.scrollLeft = (containerWidth - wrapperWidth) / 2;
-  canvasWrapper.scrollTop  = (containerHeight - wrapperHeight) / 2;
+  canvasWrapper.scrollLeft = Math.max(0, (cssW - wrapperWidth) / 2);
+  canvasWrapper.scrollTop  = Math.max(0, (cssH - wrapperHeight) / 2);
 }
 
 function getMousePos(e){
@@ -576,8 +629,11 @@ function handleMouseDown(e){
 
   if (canvasMode === 'pan') {
     isPanning = true;
-    panStartX = e.clientX - canvasWrapper.scrollLeft;
-    panStartY = e.clientY - canvasWrapper.scrollTop;
+    panStartClientX = e.clientX;
+    panStartClientY = e.clientY;
+    panStartScrollLeft = canvasWrapper.scrollLeft;
+    panStartScrollTop  = canvasWrapper.scrollTop;
+    canvas.classList.add('panning');
     canvas.style.cursor = 'grabbing';
     updateStatus('Panning canvas...');
     selectedRect = null;
@@ -591,9 +647,12 @@ function handleMouseDown(e){
     isDrawing = true;
     startX = pos.x;
     startY = pos.y;
-    const blockId = generateBlockId();
-    currentRect = { x: startX, y: startY, width: 0, height: 0,
-      Block_ID: blockId, Block_Type: 'Text', Text_Content: '', Text_ID: '', Boundary_Boxes: [0,0,0,0] };
+    currentRect = {
+      _uid: uid(),
+      x: startX, y: startY, width: 0, height: 0,
+      Block_ID: 'block_temp',
+      Block_Type: 'Text', Text_Content: '', Text_ID: '', Boundary_Boxes: [0,0,0,0]
+    };
     updateStatus("Drawing new rectangle...");
   }
 }
@@ -602,10 +661,10 @@ function handleMouseMove(e){
   const pos = getMousePos(e);
 
   if (isPanning) {
-    const newScrollLeft = panStartX - e.clientX;
-    const newScrollTop  = panStartY - e.clientY;
-    canvasWrapper.scrollLeft = -newScrollLeft;
-    canvasWrapper.scrollTop = -newScrollTop;
+    const dx = e.clientX - panStartClientX;
+    const dy = e.clientY - panStartClientY;
+    canvasWrapper.scrollLeft = panStartScrollLeft - dx;
+    canvasWrapper.scrollTop  = panStartScrollTop  - dy;
     return;
   }
 
@@ -627,6 +686,7 @@ function handleMouseMove(e){
 function handleMouseUp(e){
   if (isPanning) {
     isPanning = false;
+    canvas.classList.remove('panning');
     canvas.style.cursor = canvasMode === 'pan' ? 'grab' : 'crosshair';
     updateStatus(canvasMode === 'pan' ? 'Pan mode' : 'Draw mode');
     return;
@@ -742,11 +802,22 @@ function drawBlockId(rect, isSelected){
   ctx.font = '11px Arial';
   const metrics = ctx.measureText(idText);
   const padding = 4, margin = 5;
-  const idX = rect.x + rect.width + margin, idY = rect.y;
+  let idX = rect.x + rect.width + margin;
+  let idY = Math.max(0, rect.y);
+
+  const boxW = metrics.width + padding*2;
+  // Clamp horizontally (flip to left if overflowing)
+  if (idX + boxW > canvas.width - 1) {
+    idX = Math.max(0, rect.x - margin - boxW);
+  }
+  // Clamp vertically
+  if (idY < 0) idY = 0;
+  if (idY + 16 > canvas.height) idY = canvas.height - 16;
+
   ctx.fillStyle = 'rgba(255,255,255,0.95)';
-  ctx.fillRect(idX, idY, metrics.width + padding*2, 16);
+  ctx.fillRect(idX, idY, boxW, 16);
   ctx.strokeStyle = color; ctx.lineWidth = 1;
-  ctx.strokeRect(idX, idY, metrics.width + padding*2, 16);
+  ctx.strokeRect(idX, idY, boxW, 16);
   ctx.fillStyle = color; ctx.textBaseline = 'top';
   ctx.fillText(idText, idX + padding, idY + 2);
 }
@@ -771,8 +842,8 @@ function redrawCanvas(){
 
 function rectToBbox(rect){ return [Math.round(rect.x), Math.round(rect.y), Math.round(rect.x + rect.width), Math.round(rect.y + rect.height)]; }
 function bboxToRect(b){ return { x:b[0], y:b[1], width:b[2]-b[0], height:b[3]-b[1] }; }
-function generateBlockId(){ blockCounter = rectangles.length + 1; return `block_${blockCounter}`; }
 
+// ----- Boundary box display -----
 function updateBoundaryBoxDisplay(){
   if (!selectedRect) return;
   const bbox = rectToBbox(selectedRect);
@@ -784,6 +855,7 @@ function updateBoundaryBoxDisplay(){
   if (sizeDisplay) sizeDisplay.textContent = `Size: ${bbox[2]-bbox[0]} × ${bbox[3]-bbox[1]}`;
 }
 
+// ----- finalize ops -----
 function finalizeDrawing(){
   isDrawing = false;
   if (currentRect && (Math.abs(currentRect.width) > MIN_RECT_SIZE && Math.abs(currentRect.height) > MIN_RECT_SIZE)) {
@@ -792,6 +864,7 @@ function finalizeDrawing(){
     currentRect.Boundary_Boxes = rectToBbox(currentRect);
     rectangles.push(currentRect);
     saveHistory();
+    renumberBlockIds();
     sendDataToStreamlit();
     updateStatus(`Created: ${currentRect.Block_ID}`);
   }
@@ -851,6 +924,7 @@ function finalizeResize(){
   selectedRect.Boundary_Boxes = rectToBbox(selectedRect);
   updateBoundaryBoxDisplay();
   saveHistory();
+  renumberBlockIds();
   sendDataToStreamlit();
   redrawCanvas();
   updateStatus(`Resized: ${selectedRect.Block_ID}`);
@@ -870,6 +944,7 @@ function finalizeDrag(){
   selectedRect.Boundary_Boxes = rectToBbox(selectedRect);
   updateBoundaryBoxDisplay();
   saveHistory();
+  renumberBlockIds();
   sendDataToStreamlit();
   updateStatus(`Moved: ${selectedRect.Block_ID}`);
   redrawCanvas();
@@ -882,6 +957,7 @@ function deleteSelectedRectangle(){
     selectedRect = null; selectedRectIndex = -1;
     hidePropertiesPanel();
     saveHistory();
+    renumberBlockIds();
     redrawCanvas();
     sendDataToStreamlit();
     updateStatus(`Deleted: ${deletedId}`);
@@ -900,8 +976,10 @@ function undo(){
   if (historyStep > 0) {
     historyStep--;
     rectangles = JSON.parse(JSON.stringify(history[historyStep]));
+    ensureUids();
     selectedRect = null; selectedRectIndex = -1;
     hidePropertiesPanel();
+    renumberBlockIds(false);
     redrawCanvas(); sendDataToStreamlit();
     updateStatus("Undo performed"); updateHistoryButtons();
   }
@@ -910,8 +988,10 @@ function redo(){
   if (historyStep < history.length - 1) {
     historyStep++;
     rectangles = JSON.parse(JSON.stringify(history[historyStep]));
+    ensureUids();
     selectedRect = null; selectedRectIndex = -1;
     hidePropertiesPanel();
+    renumberBlockIds(false);
     redrawCanvas(); sendDataToStreamlit();
     updateStatus("Redo performed"); updateHistoryButtons();
   }
@@ -933,7 +1013,12 @@ function updateStatus(text){
 function loadImage(imageData){
   const img = new Image();
   img.onload = function(){
-    canvas.width = img.width; canvas.height = img.height;
+    baseCanvasWidth  = img.width;
+    baseCanvasHeight = img.height;
+    canvas.width  = img.width;   // drawing buffer
+    canvas.height = img.height;
+    applyZoomCss();
+
     window.backgroundImage = img; imageLoaded = true;
     redrawCanvas(); centerCanvas();
     Streamlit.setFrameHeight(Math.max(600, Math.min(900, img.height + 150)));
@@ -990,21 +1075,31 @@ function onRender(event){
   // General rectangle updates from Python (ignore immediate echo)
   if (Array.isArray(data.rectangles)) {
     if (skipNextUpdate) { skipNextUpdate = false; return; }
-    const newRectsStr = JSON.stringify(data.rectangles);
+
+    // Build our internal rectangles but IGNORE incoming Block_IDs:
+    const incoming = data.rectangles.map(r => ({
+      _uid: uid(),
+      x: r.x || 0, y: r.y || 0, width: r.width || 100, height: r.height || 50,
+      Block_ID: 'block_temp',                 // placeholder, we will renumber
+      Block_Type: r.Block_Type || 'Text',
+      Text_Content: r.Text_Content || '',
+      Text_ID: r.Text_ID || '',
+      Boundary_Boxes: r.Boundary_Boxes || [0,0,100,50],
+    }));
+
+    const newRectsStr = JSON.stringify(incoming.map(packRect));
     const curRectsStr = JSON.stringify(rectangles.map(packRect));
     if (newRectsStr !== curRectsStr) {
-      rectangles = data.rectangles.map(r => ({
-        x: r.x || 0, y: r.y || 0, width: r.width || 100, height: r.height || 50,
-        Block_ID: r.Block_ID || generateBlockId(),
-        Block_Type: r.Block_Type || 'Text',
-        Text_Content: r.Text_Content || '',
-        Text_ID: r.Text_ID || '',
-        Boundary_Boxes: r.Boundary_Boxes || [0,0,100,50],
-      }));
+      rectangles = incoming;
+      // Selection comes from index if provided
       if (typeof data.selected_index === 'number') {
         selectedRectIndex = data.selected_index;
         selectedRect = rectangles[selectedRectIndex] || null;
+      } else {
+        selectedRectIndex = -1;
+        selectedRect = null;
       }
+      renumberBlockIds(false);
       redrawCanvas();
       updateStatus(`Loaded ${rectangles.length} rectangles`);
     }
