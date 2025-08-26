@@ -20,4 +20,3 @@ setuptools.setup(
     python_requires=">=3.7",
     install_requires=["streamlit>=1.2", "jinja2"],
 )
-
