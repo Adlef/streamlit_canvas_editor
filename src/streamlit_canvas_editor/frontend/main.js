@@ -63,6 +63,10 @@ let hasPropEdits = false;    // user changed text/type
 let hasGeomChange = false;   // draw/resize/drag actually changed geometry
 let dragStartPos = null;     // track to detect no-op drags
 
+// ----- Buffered typing -----
+let typingTimer = null;
+const TYPING_IDLE_MS = 5000;  // save after 5s of no typing
+
 // Scope events to your component root
 const getRoot = () => document.getElementById('root') || document.body;
 
@@ -195,27 +199,45 @@ function setupEventListeners() {
     }
   });
 
-  // Change events
+  // Change events (rare): commit immediately
   document.addEventListener('change', function(e) {
     if (!getRoot().contains(e.target)) return;
     if (e.target && e.target.id === 'block-type') {
-      hasPropEdits = true;          // mark dirty only on actual property change
+      hasPropEdits = true;          // actual property change
       autoSaveProperties();
       const blockType = e.target.value;
       if (blockType) updatePanelTheme(blockType);
     }
   });
 
-  // Input events (debounced)
+  // Input events: buffer typing, push on idle/blur
   document.addEventListener('input', function(e) {
     if (!getRoot().contains(e.target)) return;
     if (e.target && (e.target.id === 'text-content' || e.target.id === 'text-id')) {
-      hasPropEdits = true;          // mark dirty only on actual text edits
-      debouncedAutoSave();
+      hasPropEdits = true;
+
+      // keep local model in sync instantly (no Streamlit push yet)
+      if (selectedRect && selectedRectIndex >= 0) {
+        if (e.target.id === 'text-content') selectedRect.Text_Content = e.target.value;
+        else selectedRect.Text_ID = e.target.value;
+        rectangles[selectedRectIndex] = selectedRect;
+      }
+
+      if (typingTimer) clearTimeout(typingTimer);
+      typingTimer = setTimeout(flushTypingChanges, TYPING_IDLE_MS);
     }
   });
+
+  // Flush on blur too
+  document.addEventListener('blur', function(e) {
+    if (!getRoot().contains(e.target)) return;
+    if (e.target && (e.target.id === 'text-content' || e.target.id === 'text-id')) {
+      flushTypingChanges();
+    }
+  }, true);
 }
 
+// Debounce for legacy paths (kept but not used for typing)
 function debounce(func, wait) {
   let timeout;
   return function(...args) {
@@ -295,7 +317,7 @@ function resetOCRButton() {
 
 function packRect(rect) {
   return {
-    Block_ID: rect.Block_ID,             // ALWAYS our generated ID
+    Block_ID: rect.Block_ID,
     Block_Type: rect.Block_Type || 'Text',
     Text_Content: rect.Text_Content || '',
     Text_ID: rect.Text_ID || '',
@@ -422,8 +444,8 @@ function showPropertiesPanel(rect) {
   const textIdField = document.getElementById('text-id');
 
   if (blockIdField) {
-    blockIdField.value = rect.Block_ID;     // show our generated ID
-    blockIdField.readOnly = true;           // ID is NOT editable
+    blockIdField.value = rect.Block_ID;
+    blockIdField.readOnly = true;
     blockIdField.style.background = '#e9ecef';
     blockIdField.style.cursor = 'not-allowed';
   }
@@ -432,8 +454,7 @@ function showPropertiesPanel(rect) {
   if (textContentField) textContentField.value = rect.Text_Content || '';
   if (textIdField) textIdField.value = rect.Text_ID || '';
 
-  // Opening the panel is NOT an edit
-  hasPropEdits = false;
+  hasPropEdits = false; // opening is not an edit
 
   updateBoundaryBoxDisplay();
 
@@ -475,7 +496,7 @@ function hidePropertiesPanel() {
   }
   const propertySections = panel.querySelectorAll('.property-section');
   propertySections.forEach(s => { s.style.background = ''; s.style.borderLeft = ''; });
-  hasPropEdits = false; // closing is not an edit
+  hasPropEdits = false;
 }
 
 function saveProperties(addToHistory = true) {
@@ -492,7 +513,7 @@ function saveProperties(addToHistory = true) {
     rectangles[selectedRectIndex] = selectedRect;
 
     if (addToHistory) saveHistory();
-    renumberBlockIds();              // keep IDs in order after edits
+    renumberBlockIds();
     redrawCanvas();
     sendDataToStreamlit();
     updateStatus(`Properties saved for ${selectedRect.Block_ID}`);
@@ -500,11 +521,23 @@ function saveProperties(addToHistory = true) {
 }
 
 function autoSaveProperties() {
-  // Only autosave if there were actual property edits
+  // only autosave if there were actual property edits
   if (selectedRect && selectedRectIndex >= 0 && hasPropEdits) {
     saveProperties(false);
-    hasPropEdits = false;       // reset after saving
+    hasPropEdits = false;
   }
+}
+
+// Flush buffered typing to Streamlit (idle/blur)
+function flushTypingChanges() {
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+  if (!selectedRect || selectedRectIndex < 0) return;
+  if (!hasPropEdits) return;
+
+  saveProperties(false);   // commit locally
+  hasPropEdits = false;
+  sendDataToStreamlit();   // single push
+  updateStatus(`Saved edits for ${selectedRect.Block_ID}`);
 }
 
 // ---- Reset Content ----
@@ -553,7 +586,6 @@ function setZoom(newZoom){
   newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
   if (newZoom === zoomLevel) return;
 
-  // Keep the center point stable
   const rect = canvasWrapper.getBoundingClientRect();
   const centerX = rect.width / 2;
   const centerY = rect.height / 2;
@@ -576,13 +608,11 @@ function handleWheel(e){
     const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
     setZoom(zoomLevel + delta);
   }
-  // else: allow natural scrolling of canvasWrapper
 }
 
 function updateZoomDisplay(){
-  const zoomText = `${Math.round(zoomLevel * 100)}%`;
   const elem = document.getElementById('zoom-level');
-  if (elem) elem.textContent = zoomText;
+  if (elem) elem.textContent = `${Math.round(zoomLevel * 100)}%`;
 }
 function updateZoomButtons(){
   const zin = document.getElementById('zoom-in-btn');
@@ -637,7 +667,7 @@ function handleMouseDown(e){
     hidePropertiesPanel();
     setTimeout(() => showPropertiesPanel(clickedRect), 10);
     isDragging = true;
-    dragStartPos = { x: clickedRect.x, y: clickedRect.y }; // track for no-op drag
+    dragStartPos = { x: clickedRect.x, y: clickedRect.y };
     dragOffset.x = pos.x - clickedRect.x;
     dragOffset.y = pos.y - clickedRect.y;
     updateStatus(`Selected: ${clickedRect.Block_ID || 'Rectangle'}`);
@@ -789,7 +819,7 @@ function updateCursor(pos){
   }
   if (selectedRect && getResizeHandle(pos.x, pos.y, selectedRect)) {
     const handle = getResizeHandle(pos.x, pos.y, selectedRect);
-    const cursors = { nw:'nw-resize', ne:'ne-resize', se:'se-resize', sw:'sw-resize' };
+    const cursors = { nw:'nw-resize', ne:'ne-resize', se:'se-resize' , sw:'sw-resize' };
     canvas.style.cursor = cursors[handle];
   } else if (rectangles.some(r=>isPointInRect(pos.x,pos.y,r))) {
     canvas.style.cursor = 'move';
@@ -824,11 +854,9 @@ function drawBlockId(rect, isSelected){
   let idY = Math.max(0, rect.y);
 
   const boxW = metrics.width + padding*2;
-  // Clamp horizontally (flip to left if overflowing)
   if (idX + boxW > canvas.width - 1) {
     idX = Math.max(0, rect.x - margin - boxW);
   }
-  // Clamp vertically
   if (idY < 0) idY = 0;
   if (idY + 16 > canvas.height) idY = canvas.height - 16;
 
@@ -883,7 +911,7 @@ function finalizeDrawing(){
     rectangles.push(currentRect);
     saveHistory();
     renumberBlockIds();
-    hasGeomChange = true;         // created a new rect counts as geometry change
+    hasGeomChange = true;
     sendDataToStreamlit();
     updateStatus(`Created: ${currentRect.Block_ID}`);
   }
@@ -944,7 +972,7 @@ function finalizeResize(){
   updateBoundaryBoxDisplay();
   saveHistory();
   renumberBlockIds();
-  hasGeomChange = true;         // resize changed geometry
+  hasGeomChange = true;
   sendDataToStreamlit();
   redrawCanvas();
   updateStatus(`Resized: ${selectedRect.Block_ID}`);
@@ -983,7 +1011,7 @@ function finalizeDrag(){
   updateBoundaryBoxDisplay();
   saveHistory();
   renumberBlockIds();
-  hasGeomChange = true;         // move changed geometry
+  hasGeomChange = true;
   sendDataToStreamlit();
   updateStatus(`Moved: ${selectedRect.Block_ID}`);
   redrawCanvas();
@@ -1055,7 +1083,7 @@ function loadImage(imageData){
   img.onload = function(){
     baseCanvasWidth  = img.width;
     baseCanvasHeight = img.height;
-    canvas.width  = img.width;   // drawing buffer
+    canvas.width  = img.width;
     canvas.height = img.height;
     applyZoomCss();
 
@@ -1105,12 +1133,12 @@ function onRender(event){
         currentlyProcessingBlockId = null;
         redrawCanvas();
         saveHistory();
-        hasPropEdits = false;  // OCR-filled text is handled as its own save flow on Python side
+        hasPropEdits = false;
         updateStatus(`OCR completed for ${rectangles[rectIndex].Block_ID}`);
         sendDataToStreamlit();
       }
     }
-    return; // do not process other updates in the same tick
+    return;
   }
 
   // General rectangle updates from Python (ignore immediate echo)
@@ -1121,7 +1149,7 @@ function onRender(event){
     const incoming = data.rectangles.map(r => ({
       _uid: uid(),
       x: r.x || 0, y: r.y || 0, width: r.width || 100, height: r.height || 50,
-      Block_ID: 'block_temp',                 // placeholder, we will renumber
+      Block_ID: 'block_temp',
       Block_Type: r.Block_Type || 'Text',
       Text_Content: r.Text_Content || '',
       Text_ID: r.Text_ID || '',
@@ -1132,7 +1160,6 @@ function onRender(event){
     const curRectsStr = JSON.stringify(rectangles.map(packRect));
     if (newRectsStr !== curRectsStr) {
       rectangles = incoming;
-      // Selection comes from index if provided
       if (typeof data.selected_index === 'number') {
         selectedRectIndex = data.selected_index;
         selectedRect = rectangles[selectedRectIndex] || null;
