@@ -58,6 +58,11 @@ let blockTypeColors = {
   'other':'#A9A9A9'
 };
 
+// ----- New flags to avoid autosave on plain clicks -----
+let hasPropEdits = false;    // user changed text/type
+let hasGeomChange = false;   // draw/resize/drag actually changed geometry
+let dragStartPos = null;     // track to detect no-op drags
+
 // Scope events to your component root
 const getRoot = () => document.getElementById('root') || document.body;
 
@@ -194,6 +199,7 @@ function setupEventListeners() {
   document.addEventListener('change', function(e) {
     if (!getRoot().contains(e.target)) return;
     if (e.target && e.target.id === 'block-type') {
+      hasPropEdits = true;          // mark dirty only on actual property change
       autoSaveProperties();
       const blockType = e.target.value;
       if (blockType) updatePanelTheme(blockType);
@@ -204,6 +210,7 @@ function setupEventListeners() {
   document.addEventListener('input', function(e) {
     if (!getRoot().contains(e.target)) return;
     if (e.target && (e.target.id === 'text-content' || e.target.id === 'text-id')) {
+      hasPropEdits = true;          // mark dirty only on actual text edits
       debouncedAutoSave();
     }
   });
@@ -425,6 +432,9 @@ function showPropertiesPanel(rect) {
   if (textContentField) textContentField.value = rect.Text_Content || '';
   if (textIdField) textIdField.value = rect.Text_ID || '';
 
+  // Opening the panel is NOT an edit
+  hasPropEdits = false;
+
   updateBoundaryBoxDisplay();
 
   const ocrBtn = document.getElementById('ocr-btn');
@@ -465,6 +475,7 @@ function hidePropertiesPanel() {
   }
   const propertySections = panel.querySelectorAll('.property-section');
   propertySections.forEach(s => { s.style.background = ''; s.style.borderLeft = ''; });
+  hasPropEdits = false; // closing is not an edit
 }
 
 function saveProperties(addToHistory = true) {
@@ -489,8 +500,10 @@ function saveProperties(addToHistory = true) {
 }
 
 function autoSaveProperties() {
-  if (selectedRect && selectedRectIndex >= 0) {
+  // Only autosave if there were actual property edits
+  if (selectedRect && selectedRectIndex >= 0 && hasPropEdits) {
     saveProperties(false);
+    hasPropEdits = false;       // reset after saving
   }
 }
 
@@ -615,11 +628,16 @@ function handleMouseDown(e){
   }
 
   if (clickedRect) {
+    // Pure selection shouldn't trigger autosave later
+    hasPropEdits = false;
+    hasGeomChange = false;
+
     selectedRect = clickedRect;
     selectedRectIndex = clickedIndex;
     hidePropertiesPanel();
     setTimeout(() => showPropertiesPanel(clickedRect), 10);
     isDragging = true;
+    dragStartPos = { x: clickedRect.x, y: clickedRect.y }; // track for no-op drag
     dragOffset.x = pos.x - clickedRect.x;
     dragOffset.y = pos.y - clickedRect.y;
     updateStatus(`Selected: ${clickedRect.Block_ID || 'Rectangle'}`);
@@ -865,6 +883,7 @@ function finalizeDrawing(){
     rectangles.push(currentRect);
     saveHistory();
     renumberBlockIds();
+    hasGeomChange = true;         // created a new rect counts as geometry change
     sendDataToStreamlit();
     updateStatus(`Created: ${currentRect.Block_ID}`);
   }
@@ -925,26 +944,46 @@ function finalizeResize(){
   updateBoundaryBoxDisplay();
   saveHistory();
   renumberBlockIds();
+  hasGeomChange = true;         // resize changed geometry
   sendDataToStreamlit();
   redrawCanvas();
   updateStatus(`Resized: ${selectedRect.Block_ID}`);
 }
 
 function dragRectangle(pos){
-  selectedRect.x = Math.max(0, Math.min(canvas.width  - selectedRect.width,  pos.x - dragOffset.x));
-  selectedRect.y = Math.max(0, Math.min(canvas.height - selectedRect.height, pos.y - dragOffset.y));
-  rectangles[selectedRectIndex] = selectedRect;
-  updateBoundaryBoxDisplay();
-  redrawCanvas();
-  updateStatus(`Moving: ${selectedRect.Block_ID}`);
+  const newX = Math.max(0, Math.min(canvas.width  - selectedRect.width,  pos.x - dragOffset.x));
+  const newY = Math.max(0, Math.min(canvas.height - selectedRect.height, pos.y - dragOffset.y));
+  if (newX !== selectedRect.x || newY !== selectedRect.y) {
+    selectedRect.x = newX;
+    selectedRect.y = newY;
+    rectangles[selectedRectIndex] = selectedRect;
+    updateBoundaryBoxDisplay();
+    redrawCanvas();
+    updateStatus(`Moving: ${selectedRect.Block_ID}`);
+  }
 }
 
 function finalizeDrag(){
+  if (!isDragging) return;
   isDragging = false;
+
+  // If nothing actually moved, treat as pure selection (no save/send/renumber)
+  if (dragStartPos &&
+      selectedRect &&
+      selectedRect.x === dragStartPos.x &&
+      selectedRect.y === dragStartPos.y) {
+    dragStartPos = null;
+    updateStatus(`Selected: ${selectedRect.Block_ID}`);
+    redrawCanvas();
+    return;
+  }
+  dragStartPos = null;
+
   selectedRect.Boundary_Boxes = rectToBbox(selectedRect);
   updateBoundaryBoxDisplay();
   saveHistory();
   renumberBlockIds();
+  hasGeomChange = true;         // move changed geometry
   sendDataToStreamlit();
   updateStatus(`Moved: ${selectedRect.Block_ID}`);
   redrawCanvas();
@@ -958,6 +997,7 @@ function deleteSelectedRectangle(){
     hidePropertiesPanel();
     saveHistory();
     renumberBlockIds();
+    hasGeomChange = true;
     redrawCanvas();
     sendDataToStreamlit();
     updateStatus(`Deleted: ${deletedId}`);
@@ -1065,6 +1105,7 @@ function onRender(event){
         currentlyProcessingBlockId = null;
         redrawCanvas();
         saveHistory();
+        hasPropEdits = false;  // OCR-filled text is handled as its own save flow on Python side
         updateStatus(`OCR completed for ${rectangles[rectIndex].Block_ID}`);
         sendDataToStreamlit();
       }
