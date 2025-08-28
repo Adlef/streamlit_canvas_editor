@@ -752,21 +752,38 @@ function handleMouseOut(e){
   }
 }
 
+// Helper: detect when typing in inputs/textareas/contentEditable
+function isTypingTarget(t) {
+  return t && (
+    t.tagName === 'INPUT' ||
+    t.tagName === 'TEXTAREA' ||
+    t.isContentEditable
+  );
+}
+
 function handleKeyDown(e){
+  // If the user is typing in a field, let the browser handle everything.
+  if (isTypingTarget(e.target)) return;
+
   if (e.ctrlKey || e.metaKey) {
     if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomIn(); }
     else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomOut(); }
     else if (e.key === '0') { e.preventDefault(); zoomReset(); }
+    else if (e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+    else if (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey)) { e.preventDefault(); redo(); }
+    return;
   }
-  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedRect && !e.target.matches('input, textarea')) {
-    deleteSelectedRectangle();
-  } else if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
-    e.preventDefault(); undo();
-  } else if (e.ctrlKey && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
-    e.preventDefault(); redo();
-  } else if (e.key === 'Escape') {
-    selectedRect = null; selectedRectIndex = -1; hidePropertiesPanel(); redrawCanvas(); updateStatus("Selection cleared");
+
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedRect) {
+    e.preventDefault(); deleteSelectedRectangle(); return;
   }
+
+  if (e.key === 'Escape') {
+    selectedRect = null; selectedRectIndex = -1;
+    hidePropertiesPanel(); redrawCanvas(); updateStatus("Selection cleared");
+    return;
+  }
+
   if (e.key.toLowerCase() === 'v') { e.preventDefault(); setCanvasMode('pan'); }
   else if (e.key.toLowerCase() === 'd') { e.preventDefault(); setCanvasMode('draw'); }
 }
