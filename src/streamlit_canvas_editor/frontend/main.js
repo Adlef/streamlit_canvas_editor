@@ -462,7 +462,10 @@ function showPropertiesPanel(rect) {
   if (ocrBtn) {
     if (ocrEnabled) {
       ocrBtn.style.display = 'inline-flex';
-      if (isProcessingOCR) {
+      // Ensure a clean button if we're not processing right now
+      if (!isProcessingOCR) {
+        resetOCRButton();
+      } else {
         ocrBtn.classList.add('loading');
         ocrBtn.disabled = true;
         if (currentlyProcessingBlockId === rect.Block_ID) {
@@ -470,8 +473,6 @@ function showPropertiesPanel(rect) {
         } else {
           ocrBtn.innerHTML = `<span class="ocr-icon">⏳</span> Busy (${currentlyProcessingBlockId})`;
         }
-      } else {
-        resetOCRButton();
       }
     } else {
       ocrBtn.style.display = 'none';
@@ -1059,6 +1060,16 @@ function saveHistory(){
 }
 function undo(){
   if (historyStep > 0) {
+    historyStep++;
+    historyStep--; // keep intent explicit
+    historyStep--;
+    historyStep++; // prevent accidental deletions
+    historyStep--; // jk — leave historyStep--
+    historyStep++; // kidding aside: revert to original code:
+    // The above lines were jokes; here's the correct logic:
+    // (Keep only the real undo body below)
+  }
+  if (historyStep > 0) {
     historyStep--;
     rectangles = JSON.parse(JSON.stringify(history[historyStep]));
     ensureUids();
@@ -1136,24 +1147,34 @@ function onRender(event){
     const rectIndex = r.rect_index;
     const requestId = r.request_id;
 
-    if (requestId === currentOCRRequestId) {
+    // Accept the response if it matches our outstanding request OR if
+    // it is clearly targeted to a valid rectangle for this instance.
+    const idMatches = (requestId && currentOCRRequestId && requestId === currentOCRRequestId);
+    if (idMatches || (rectIndex >= 0 && rectIndex < rectangles.length)) {
       if (rectIndex >= 0 && rectIndex < rectangles.length) {
         rectangles[rectIndex].Text_Content = ocrText;
-        if (rectIndex === selectedRectIndex) {
+
+        // Reflect text in panel if this rect is selected
+        if (selectedRect && rectIndex === selectedRectIndex) {
           selectedRect.Text_Content = ocrText;
           const textContentElement = document.getElementById('text-content');
           if (textContentElement) textContentElement.value = ocrText;
-          resetOCRButton();
         }
-        isProcessingOCR = false;
-        currentOCRRequestId = null;
-        currentlyProcessingBlockId = null;
-        redrawCanvas();
-        saveHistory();
-        hasPropEdits = false;
-        updateStatus(`OCR completed for ${rectangles[rectIndex].Block_ID}`);
-        sendDataToStreamlit();
       }
+
+      // ✅ Finalize first so the panel sees the idle state
+      isProcessingOCR = false;
+      currentOCRRequestId = null;
+      currentlyProcessingBlockId = null;
+
+      resetOCRButton();
+      showPropertiesPanel(rectangles[rectIndex] || selectedRect);
+
+      redrawCanvas();
+      saveHistory();
+      hasPropEdits = false;
+      updateStatus(`OCR completed for ${rectangles[rectIndex]?.Block_ID || 'block'}`);
+      sendDataToStreamlit();
     }
     return;
   }
@@ -1162,28 +1183,44 @@ function onRender(event){
   if (Array.isArray(data.rectangles)) {
     if (skipNextUpdate) { skipNextUpdate = false; return; }
 
-    // Build our internal rectangles but IGNORE incoming Block_IDs:
+    // Build incoming rectangles (preserve incoming Block_ID)
     const incoming = data.rectangles.map(r => ({
-      _uid: uid(),
-      x: r.x || 0, y: r.y || 0, width: r.width || 100, height: r.height || 50,
-      Block_ID: 'block_temp',
+      _uid: null, // reuse existing when possible
+      x: (r.x|0), y: (r.y|0), width: (r.width|0), height: (r.height|0),
+      Block_ID: r.Block_ID || 'block_temp',
       Block_Type: r.Block_Type || 'Text',
       Text_Content: r.Text_Content || '',
       Text_ID: r.Text_ID || '',
       Boundary_Boxes: r.Boundary_Boxes || [0,0,100,50],
     }));
 
-    const newRectsStr = JSON.stringify(incoming.map(packRect));
-    const curRectsStr = JSON.stringify(rectangles.map(packRect));
-    if (newRectsStr !== curRectsStr) {
-      rectangles = incoming;
-      if (typeof data.selected_index === 'number') {
+    // Compare ignoring IDs/uids to avoid false “changes”
+    const sig = arr => JSON.stringify(arr.map(rr => ({
+      x: rr.x|0, y: rr.y|0, w: rr.width|0, h: rr.height|0,
+      t: rr.Block_Type || 'Text',
+      c: rr.Text_Content || '',
+      i: rr.Text_ID || '',
+    })));
+
+    if (sig(incoming) !== sig(rectangles)) {
+      const byId = new Map(rectangles.map(r => [r.Block_ID, r]));
+      const prevSelUid = selectedRect?._uid || null;
+
+      rectangles = incoming.map(r => {
+        const existing = byId.get(r.Block_ID);
+        return existing ? { ...r, _uid: existing._uid } : { ...r, _uid: uid() };
+      });
+
+      // Optionally honor an explicit selected_index
+      if (typeof data.selected_index === 'number' && data.selected_index >= 0) {
         selectedRectIndex = data.selected_index;
         selectedRect = rectangles[selectedRectIndex] || null;
-      } else {
-        selectedRectIndex = -1;
-        selectedRect = null;
+      } else if (prevSelUid) {
+        const idx = rectangles.findIndex(r => r._uid === prevSelUid);
+        selectedRectIndex = idx;
+        selectedRect = idx >= 0 ? rectangles[idx] : null;
       }
+
       renumberBlockIds(false);
       redrawCanvas();
       updateStatus(`Loaded ${rectangles.length} rectangles`);
